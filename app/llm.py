@@ -1,12 +1,15 @@
-"""LLM client and prompt orchestration for operator note interpretation via OpenRouter."""
+"""LLM client, prompt orchestration, and primitive assembly for GridWise operator notes."""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 from openai import OpenAI
+
+from app.fallback_parser import parse_operator_note_fallback
 
 logger = logging.getLogger("gridwise.llm")
 
@@ -241,46 +244,280 @@ Output:
 """
 
 
-def get_openrouter_client() -> Optional[OpenAI]:
-    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if not api_key:
-        logger.warning("OPENROUTER_API_KEY is not set.")
-        return None
-    return OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=api_key,
-        timeout=25.0,
-    )
+def get_llm_client() -> Tuple[Optional[OpenAI], str]:
+    """Returns an active LLM client and model name.
+
+    Priority:
+    1. Groq (primary, ultra-fast Llama 3.3 70B)
+    2. OpenRouter (fallback)
+    """
+    groq_key = os.environ.get("GROQ_API_KEY", "").strip()
+    if groq_key:
+        client = OpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=groq_key,
+            timeout=8.0,
+        )
+        return client, "llama-3.3-70b-versatile"
+
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if openrouter_key:
+        model = os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free").strip()
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=openrouter_key,
+            timeout=12.0,
+        )
+        return client, model
+
+    return None, ""
 
 
-def call_llm_for_interpretations(operator_notes: List[str]) -> Optional[str]:
-    """Calls OpenRouter with operator notes and returns the raw JSON string response."""
-    client = get_openrouter_client()
-    if client is None:
-        logger.warning("No OpenRouter client available; returning None for guardrail fallback.")
-        return None
+def _convert_window_to_hours(window: Optional[Dict[str, Any]]) -> List[int]:
+    """Converts a window primitive {start_hour, end_hour} into a sorted list of unique ints 0..23."""
+    if not window or not isinstance(window, dict):
+        return []
 
-    model_name = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini").strip() or "openai/gpt-4o-mini"
+    start = window.get("start_hour")
+    end = window.get("end_hour")
+
+    if start is None or end is None:
+        return []
+
+    try:
+        start = int(start)
+        end = int(end)
+    except (ValueError, TypeError):
+        return []
+
+    start = max(0, min(24, start))
+    end = max(0, min(24, end))
+
+    if start == end:
+        return [start] if start < 24 else [23]
+    elif start < end:
+        return list(range(start, end))
+    else:
+        wrapped = list(range(start, 24)) + list(range(0, end))
+        return sorted(list(set(wrapped)))
+
+
+def assemble_directive_from_primitive(
+    raw_item: Dict[str, Any],
+    note_text: str,
+    note_index: int,
+    battery_capacity_kwh: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Assembles a canonical DirectiveInterpretation dict from LLM primitive output."""
+    d_type = raw_item.get("directive_type", "no_op")
+    reasoning = raw_item.get("reasoning", "") or f"Directive for note: {note_text[:50]}"
+    cap = battery_capacity_kwh or 500.0
+
+    valid_types = {
+        "solar_reduction",
+        "minimum_battery_reserve",
+        "no_charge_window",
+        "no_discharge_window",
+        "max_grid_window",
+        "no_op",
+    }
+
+    if d_type not in valid_types or d_type == "no_op":
+        return {
+            "note_index": note_index,
+            "applies": False,
+            "directive_type": "no_op",
+            "structured_adjustment": None,
+            "explanation": reasoning,
+        }
+
+    hours = _convert_window_to_hours(raw_item.get("window"))
+    if not hours:
+        fallback = parse_operator_note_fallback(note_text, note_index, cap)
+        if fallback.get("applies"):
+            return fallback
+        return {
+            "note_index": note_index,
+            "applies": False,
+            "directive_type": "no_op",
+            "structured_adjustment": None,
+            "explanation": f"{reasoning} (no active window extracted)",
+        }
+
+    if d_type == "solar_reduction":
+        red_type = raw_item.get("reduction_type", "remaining")
+        pct = raw_item.get("percent")
+        if pct is None:
+            pct = 20.0
+        try:
+            pct = float(pct)
+        except (ValueError, TypeError):
+            pct = 20.0
+
+        if red_type == "remaining":
+            factor = pct / 100.0
+        else:
+            factor = 1.0 - (pct / 100.0)
+
+        factor = max(0.0, min(1.0, factor))
+        return {
+            "note_index": note_index,
+            "applies": True,
+            "directive_type": "solar_reduction",
+            "structured_adjustment": {"hours": hours, "factor": round(factor, 4)},
+            "explanation": reasoning,
+        }
+
+    elif d_type == "minimum_battery_reserve":
+        val_obj = raw_item.get("value") or {}
+        num = val_obj.get("number", 0.0)
+        unit = str(val_obj.get("unit", "kwh")).lower()
+
+        try:
+            num = float(num)
+        except (ValueError, TypeError):
+            num = 0.0
+
+        if unit == "mwh":
+            min_kwh = num * 1000.0
+        elif unit == "percent_of_capacity":
+            min_kwh = (num / 100.0) * cap
+        else:
+            min_kwh = num
+
+        min_kwh = max(0.0, min_kwh)
+        if min_kwh > cap:
+            min_kwh = cap
+
+        return {
+            "note_index": note_index,
+            "applies": True,
+            "directive_type": "minimum_battery_reserve",
+            "structured_adjustment": {"hours": hours, "minimum_energy_kwh": round(min_kwh, 2)},
+            "explanation": reasoning,
+        }
+
+    elif d_type in ("no_charge_window", "no_discharge_window"):
+        return {
+            "note_index": note_index,
+            "applies": True,
+            "directive_type": d_type,
+            "structured_adjustment": {"hours": hours},
+            "explanation": reasoning,
+        }
+
+    elif d_type == "max_grid_window":
+        val_obj = raw_item.get("value") or {}
+        num = val_obj.get("number", 0.0)
+        try:
+            max_grid = max(0.0, float(num))
+        except (ValueError, TypeError):
+            max_grid = 0.0
+
+        return {
+            "note_index": note_index,
+            "applies": True,
+            "directive_type": "max_grid_window",
+            "structured_adjustment": {"hours": hours, "max_grid_kwh": round(max_grid, 2)},
+            "explanation": reasoning,
+        }
+
+    return {
+        "note_index": note_index,
+        "applies": False,
+        "directive_type": "no_op",
+        "structured_adjustment": None,
+        "explanation": reasoning,
+    }
+
+
+def call_llm_for_interpretations(
+    operator_notes: List[str],
+    battery_capacity_kwh: Optional[float] = None,
+) -> Optional[str]:
+    """Interprets operator notes into validated directive JSON string."""
+    total_notes = len(operator_notes)
+    if total_notes == 0:
+        return json.dumps({"interpretations": []})
 
     user_payload = {
+        "battery_capacity_kwh": battery_capacity_kwh or 500.0,
         "notes": [
             {"note_index": idx, "text": note}
             for idx, note in enumerate(operator_notes)
-        ]
+        ],
     }
+    user_content = (
+        f"Extract directive primitives for the following operator notes:\n"
+        f"{json.dumps(user_payload, indent=2)}"
+    )
 
-    try:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Extract directives for the following operator notes:\n{json.dumps(user_payload, indent=2)}"},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.0,
-        )
-        content = response.choices[0].message.content
-        return content
-    except Exception as e:
-        logger.error(f"Error calling OpenRouter LLM: {e}", exc_info=True)
-        return None
+    client, model_name = get_llm_client()
+    raw_content: Optional[str] = None
+
+    if client is not None:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+
+        for attempt in range(2):
+            try:
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    temperature=0.0,
+                )
+                raw_content = response.choices[0].message.content
+                if raw_content:
+                    test_data = json.loads(raw_content)
+                    if "interpretations" in test_data:
+                        break
+            except Exception as e:
+                logger.warning(f"LLM call attempt {attempt + 1} failed: {e}")
+                if attempt == 0:
+                    messages.append({
+                        "role": "user",
+                        "content": f"The previous response failed with error: {str(e)}. Please output valid JSON matching the schema.",
+                    })
+
+    assembled_directives: List[Dict[str, Any]] = []
+
+    if raw_content:
+        try:
+            parsed = json.loads(raw_content)
+            items = parsed.get("interpretations", [])
+            items_by_idx = {
+                item.get("note_index"): item
+                for item in items
+                if isinstance(item, dict) and "note_index" in item
+            }
+
+            for idx in range(total_notes):
+                if idx in items_by_idx:
+                    assembled = assemble_directive_from_primitive(
+                        items_by_idx[idx],
+                        operator_notes[idx],
+                        idx,
+                        battery_capacity_kwh,
+                    )
+                    assembled_directives.append(assembled)
+                else:
+                    fallback = parse_operator_note_fallback(
+                        operator_notes[idx], idx, battery_capacity_kwh
+                    )
+                    assembled_directives.append(fallback)
+
+        except Exception as e:
+            logger.error(f"Error parsing LLM primitives: {e}. Degrading to fallback parser.")
+            assembled_directives = []
+
+    if not assembled_directives:
+        logger.info("Executing deterministic fallback parser for operator notes.")
+        assembled_directives = [
+            parse_operator_note_fallback(note, idx, battery_capacity_kwh)
+            for idx, note in enumerate(operator_notes)
+        ]
+
+    return json.dumps({"interpretations": assembled_directives})

@@ -1,0 +1,4 @@
+# Claude Code Instructions
+
+Read `docs/CONTEXT.md` before touching any code — it's the canonical schema/rules reference for this repo.
+See `AGENTS.md` for the non-negotiable checklist (endpoint names, directive types, guardrail behavior, replay/sanity check, secret handling). Everything in `AGENTS.md` applies to you too.

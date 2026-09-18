@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Tuple
+import random
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
 import pulp
 
 from app.schemas import (
@@ -238,3 +241,202 @@ def solve_energy_schedule(
     )
 
     return hourly_plan, total_grid_kwh, total_cost_bdt, peak_grid_kwh, plan_summary
+
+
+# ---------------------------------------------------------------------------
+# Fuzz harness: .venv/Scripts/python -m app.optimizer [cases] [seed]
+# Lives here (not tests/) because tests/ is owned by Person C.
+# ---------------------------------------------------------------------------
+
+FUZZ_TIME_BUDGET_S = 3.0  # per request, relaxation included; API limit is 30 s, p95 target 5 s
+
+
+def _directive(index: int, kind: str, adjustment: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "note_index": index,
+        "applies": kind != "no_op",
+        "directive_type": kind,
+        "structured_adjustment": adjustment,
+        "explanation": "fuzz",
+    }
+
+
+def _build_case(
+    scenario_id: str,
+    hours: List[Dict[str, Any]],
+    battery: Dict[str, float],
+    raw_directives: List[Dict[str, Any]],
+) -> Tuple[OptimizeRequest, List[DirectiveInterpretation]]:
+    request = OptimizeRequest.model_validate({
+        "scenario_id": scenario_id,
+        "operator_notes": [f"fuzz note {i}" for i in range(len(raw_directives))],
+        "hours": hours,
+        "battery": battery,
+    })
+    return request, [DirectiveInterpretation.model_validate(d) for d in raw_directives]
+
+
+def _fixed_case(raw_directives: List[Dict[str, Any]]) -> Tuple[OptimizeRequest, List[DirectiveInterpretation]]:
+    """Flat 200 kWh demand, 150 kWh solar 10:00-15:00, evening peak tariff, 500 kWh battery at 200."""
+    hours = [
+        {
+            "hour": h,
+            "demand_kwh": 200.0,
+            "solar_kwh": 150.0 if 10 <= h <= 14 else 0.0,
+            "tariff_bdt_per_kwh": 12.0 if 17 <= h <= 22 else 7.0,
+        }
+        for h in range(24)
+    ]
+    battery = {
+        "capacity_kwh": 500.0,
+        "initial_energy_kwh": 200.0,
+        "minimum_energy_kwh": 50.0,
+        "max_charge_kwh_per_hour": 100.0,
+        "max_discharge_kwh_per_hour": 100.0,
+    }
+    return _build_case("FIXED", hours, battery, raw_directives)
+
+
+def _fuzz_case(rng: random.Random, scenario_id: str) -> Tuple[OptimizeRequest, List[DirectiveInterpretation]]:
+    capacity = rng.randint(150, 800)
+    minimum = rng.randint(0, capacity // 3)
+    battery = {
+        "capacity_kwh": float(capacity),
+        "minimum_energy_kwh": float(minimum),
+        "initial_energy_kwh": float(rng.randint(minimum, capacity)),
+        "max_charge_kwh_per_hour": float(rng.randint(20, 200)),
+        "max_discharge_kwh_per_hour": float(rng.randint(20, 200)),
+    }
+    solar_peak = rng.uniform(0.0, 300.0)
+    hours = [
+        {
+            "hour": h,
+            "demand_kwh": round(rng.uniform(40.0, 320.0), 2),
+            "solar_kwh": round(max(0.0, solar_peak * (1 - abs(h - 12) / 6)), 2),
+            "tariff_bdt_per_kwh": round(rng.choice([6.0, 7.5, 9.0, 11.0, 13.5]) + rng.uniform(-0.5, 0.5), 2),
+        }
+        for h in range(24)
+    ]
+    raw_directives = []
+    for index in range(rng.randint(1, 3)):
+        kind = rng.choice([
+            "solar_reduction", "minimum_battery_reserve", "no_charge_window",
+            "no_discharge_window", "max_grid_window", "no_op",
+        ])
+        if kind == "no_op":
+            raw_directives.append(_directive(index, kind, None))
+            continue
+        start = rng.randint(0, 22)
+        adjustment: Dict[str, Any] = {"hours": list(range(start, min(24, start + rng.randint(1, 4))))}
+        if kind == "solar_reduction":
+            adjustment["factor"] = rng.choice([0.0, 0.2, 0.25, 0.5, 0.8, 1.0])
+        elif kind == "minimum_battery_reserve":
+            adjustment["minimum_energy_kwh"] = float(rng.randint(minimum, capacity))
+        elif kind == "max_grid_window":
+            adjustment["max_grid_kwh"] = float(rng.randint(0, 400))
+        raw_directives.append(_directive(index, kind, adjustment))
+    return _build_case(scenario_id, hours, battery, raw_directives)
+
+
+def _fuzz_run(
+    request: OptimizeRequest,
+    directives: List[DirectiveInterpretation],
+) -> Tuple[List[str], Optional[List[PlanHour]]]:
+    """Runs one request the way main.py does (solve, then replay the same list) and lists every problem."""
+    from app.replay import replay_and_verify_plan  # read-only use of Person C's module
+
+    started = time.perf_counter()
+    try:
+        plan, total_grid, total_cost, peak_grid, _ = solve_energy_schedule(request, directives)
+    except Exception as exc:  # the harness must report, never stop
+        return [f"solver raised {type(exc).__name__}: {exc}"], None
+    elapsed = time.perf_counter() - started
+
+    problems = list(replay_and_verify_plan(request, directives, plan))
+    tariff = {entry.hour: entry.tariff_bdt_per_kwh for entry in request.hours}
+    if [p.hour for p in plan] != list(range(24)):
+        problems.append("hourly_plan hours are not exactly 0..23 in order")
+    if abs(total_grid - sum(p.grid_kwh for p in plan)) > 0.01:
+        problems.append(f"total_grid_kwh {total_grid} != sum of plan")
+    if abs(total_cost - sum(p.grid_kwh * tariff[p.hour] for p in plan)) > 0.01:
+        problems.append(f"total_cost_bdt {total_cost} != sum of plan")
+    if abs(peak_grid - max(p.grid_kwh for p in plan)) > 0.01:
+        problems.append(f"peak_grid_kwh {peak_grid} != max of plan")
+    for p in plan:
+        if (p.battery_action == "idle") != (p.battery_kwh == 0.0):
+            problems.append(f"hour {p.hour}: action {p.battery_action} with battery_kwh {p.battery_kwh}")
+    if elapsed > FUZZ_TIME_BUDGET_S:
+        problems.append(f"solve took {elapsed:.2f}s (> {FUZZ_TIME_BUDGET_S}s)")
+    return problems, plan
+
+
+def _fuzz_fixed_checks() -> List[str]:
+    failures: List[str] = []
+
+    # 1. Overlapping solar reductions compound: hour 12 keeps 0.5 * 0.2 = 0.1 of 150 kWh.
+    request, directives = _fixed_case([
+        _directive(0, "solar_reduction", {"hours": [12], "factor": 0.5}),
+        _directive(1, "solar_reduction", {"hours": [11, 12], "factor": 0.2}),
+    ])
+    problems, plan = _fuzz_run(request, directives)
+    failures += [f"solar_overlap: {p}" for p in problems]
+    if plan is not None and plan[12].solar_used_kwh > 15.0 + 1e-6:
+        failures.append(f"solar_overlap: hour 12 used {plan[12].solar_used_kwh} kWh solar, limit is 15.0 (0.5*0.2*150)")
+
+    # 2. Reserve 300 kWh at hours 22-23 cannot coexist with neutrality (initial 200).
+    #    Only that directive may be downgraded; the valid one and the no_op stay as they were.
+    request, directives = _fixed_case([
+        _directive(0, "minimum_battery_reserve", {"hours": [22, 23], "minimum_energy_kwh": 300.0}),
+        _directive(1, "no_charge_window", {"hours": [2, 3]}),
+        _directive(2, "no_op", None),
+    ])
+    problems, _ = _fuzz_run(request, directives)
+    failures += [f"reserve_conflict: {p}" for p in problems]
+    types = [d.directive_type for d in directives]
+    if types != ["no_op", "no_charge_window", "no_op"] or directives[0].applies:
+        failures.append(f"reserve_conflict: expected [no_op, no_charge_window, no_op], got {types}")
+
+    # 3. Grid cap 0 all day is infeasible alone (demand 200 > discharge 100 at night);
+    #    no-discharge all day is feasible alone. Fewest drops = drop only the cap.
+    request, directives = _fixed_case([
+        _directive(0, "max_grid_window", {"hours": list(range(24)), "max_grid_kwh": 0.0}),
+        _directive(1, "no_discharge_window", {"hours": list(range(24))}),
+    ])
+    problems, _ = _fuzz_run(request, directives)
+    failures += [f"grid_conflict: {p}" for p in problems]
+    types = [d.directive_type for d in directives]
+    if types != ["no_op", "no_discharge_window"]:
+        failures.append(f"grid_conflict: expected [no_op, no_discharge_window], got {types}")
+
+    return failures
+
+
+def _fuzz_main(argv: List[str]) -> int:
+    cases = int(argv[1]) if len(argv) > 1 else 300
+    seed = int(argv[2]) if len(argv) > 2 else 2026
+    rng = random.Random(seed)
+
+    failures = _fuzz_fixed_checks()
+    downgraded = 0
+    slowest = 0.0
+    for i in range(cases):
+        request, directives = _fuzz_case(rng, f"FUZZ-{seed}-{i}")
+        applied_before = sum(d.applies for d in directives)
+        started = time.perf_counter()
+        problems, _ = _fuzz_run(request, directives)
+        slowest = max(slowest, time.perf_counter() - started)
+        downgraded += applied_before - sum(d.applies for d in directives)
+        failures += [f"{request.scenario_id}: {p}" for p in problems]
+
+    print(
+        f"fuzz: {cases} random + 3 fixed cases, seed={seed}, failures={len(failures)}, "
+        f"downgraded directives={downgraded}, slowest request={slowest:.2f}s"
+    )
+    for failure in failures[:30]:
+        print("  FAIL", failure)
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.CRITICAL)  # keep replay/optimizer logs out of the report
+    sys.exit(_fuzz_main(sys.argv))

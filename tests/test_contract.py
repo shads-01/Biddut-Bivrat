@@ -220,7 +220,7 @@ def test_percent_reserve_resolves_against_capacity_and_cache_is_per_capacity():
         "from 6 PM until 9 PM for emergency operations."
     ]
     llm._INTERPRETATION_CACHE.clear()
-    with patch.object(llm, "get_llm_client", return_value=(None, "")):
+    with patch.object(llm, "_try_call_provider", return_value=None):
         small = json.loads(llm.call_llm_for_interpretations(note, 200.0))
         large = json.loads(llm.call_llm_for_interpretations(note, 400.0))
     llm._INTERPRETATION_CACHE.clear()

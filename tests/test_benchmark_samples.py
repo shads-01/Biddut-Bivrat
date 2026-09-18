@@ -12,6 +12,8 @@ from app.schemas import DirectiveInterpretation, OptimizeRequest
 def load_official_samples():
     sample_path = Path(__file__).parent / "BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json"
     if not sample_path.exists():
+        sample_path = Path(__file__).parent.parent / "BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json"
+    if not sample_path.exists():
         return []
     with open(sample_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -39,11 +41,14 @@ def test_optimizer_matches_official_sample_case(case):
         directives=expected_directives,
     )
 
-    # 4. Run replay check
+    # 4. Run replay check including derived totals
     violations = replay_and_verify_plan(
         request=req,
         directives=expected_directives,
         hourly_plan=hourly_plan,
+        total_grid_kwh=total_grid,
+        total_cost_bdt=total_cost,
+        peak_grid_kwh=peak_grid,
     )
     assert violations == [], f"Replay violations for {case['id']}: {violations}"
 
@@ -52,12 +57,12 @@ def test_optimizer_matches_official_sample_case(case):
     exp_total_cost = expected_output["total_cost_bdt"]
     exp_peak_grid = expected_output["peak_grid_kwh"]
 
-    assert abs(total_cost - exp_total_cost) <= 0.05, (
+    assert abs(total_cost - exp_total_cost) <= 0.01, (
         f"Cost mismatch for {case['id']}: got {total_cost}, expected {exp_total_cost}"
     )
-    assert abs(total_grid - exp_total_grid) <= 0.05, (
+    assert abs(total_grid - exp_total_grid) <= 0.01, (
         f"Grid kWh mismatch for {case['id']}: got {total_grid}, expected {exp_total_grid}"
     )
-    assert abs(peak_grid - exp_peak_grid) <= 0.05, (
+    assert abs(peak_grid - exp_peak_grid) <= 0.01, (
         f"Peak grid mismatch for {case['id']}: got {peak_grid}, expected {exp_peak_grid}"
     )

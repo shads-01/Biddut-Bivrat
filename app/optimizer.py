@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
 import random
 import sys
@@ -163,11 +164,57 @@ def _build_plan(request: OptimizeRequest, limits: _Limits, raw: Dict[str, List[f
     return plan
 
 
+def _solve_with_relaxation(
+    request: OptimizeRequest,
+    directives: List[DirectiveInterpretation],
+) -> Tuple[List[int], _Limits, Dict[str, List[float]]]:
+    """Solves with every applied directive; if infeasible, retries with the largest feasible
+    subset (ties: lowest cost). Hidden judge cases are feasible (Problem Statement 11.4), so a
+    drop here means a note was misread upstream. At most 3 notes, so at most 8 solves."""
+    hours_map = {entry.hour: entry for entry in request.hours}
+    active = [i for i, d in enumerate(directives) if d.applies and d.structured_adjustment]
+
+    for size in range(len(active), -1, -1):
+        best: Optional[Tuple[float, Tuple[int, ...], _Limits, Dict[str, List[float]]]] = None
+        for keep in itertools.combinations(active, size):
+            limits = _merge_directives(request, [directives[i] for i in keep])
+            raw = _solve_lp(request, limits)
+            if raw is None:
+                continue
+            cost = sum(raw["grid"][h] * hours_map[h].tariff_bdt_per_kwh for h in range(24))
+            if best is None or cost < best[0]:
+                best = (cost, keep, limits, raw)
+        if best is not None:
+            _, keep, limits, raw = best
+            return [i for i in active if i not in keep], limits, raw
+
+    raise ValueError("Optimizer could not find a feasible schedule even with every directive dropped.")
+
+
+def _downgrade_to_no_op(directive: DirectiveInterpretation) -> DirectiveInterpretation:
+    return DirectiveInterpretation(
+        note_index=directive.note_index,
+        applies=False,
+        directive_type="no_op",
+        structured_adjustment=None,
+        explanation=(
+            f"Downgraded to no_op: this {directive.directive_type} directive conflicts with the "
+            f"scenario's battery/grid limits, so no feasible schedule can honor it. "
+            f"{directive.explanation}"
+        ).strip(),
+    )
+
+
 def solve_energy_schedule(
     request: OptimizeRequest,
     directives: List[DirectiveInterpretation],
 ) -> Tuple[List[PlanHour], float, float, float, str]:
     """Builds and solves the 24-hour cost-minimizing LP schedule.
+
+    Side effect: if the applied directives admit no feasible schedule, the fewest conflicting
+    directives are replaced IN PLACE in `directives` with no_op entries. main.py passes this same
+    list to replay and to the response, so the downgrade reaches both with no change on the
+    caller's side. End-of-day neutrality is never relaxed.
 
     Returns:
         hourly_plan: 24 PlanHour items
@@ -177,10 +224,16 @@ def solve_energy_schedule(
         plan_summary: human-readable overview
     """
     hours_map = {entry.hour: entry for entry in request.hours}
-    limits = _merge_directives(request, directives)
-    raw = _solve_lp(request, limits)
-    if raw is None:
-        raise ValueError("Optimizer could not find a feasible schedule.")
+    dropped, limits, raw = _solve_with_relaxation(request, directives)
+    for i in dropped:
+        logger.warning(
+            "Scenario %s: note %d (%s %s) is infeasible with the rest of the scenario; downgraded to no_op",
+            request.scenario_id,
+            directives[i].note_index,
+            directives[i].directive_type,
+            directives[i].structured_adjustment,
+        )
+        directives[i] = _downgrade_to_no_op(directives[i])
     hourly_plan = _build_plan(request, limits, raw)
 
     # Summary metrics strictly from hourly_plan alone
@@ -188,11 +241,14 @@ def solve_energy_schedule(
     total_cost_bdt = round(sum(p.grid_kwh * hours_map[p.hour].tariff_bdt_per_kwh for p in hourly_plan), ROUND_DP)
     peak_grid_kwh = round(max(p.grid_kwh for p in hourly_plan), ROUND_DP)
 
+    applied = sum(d.applies for d in directives)
     plan_summary = (
         f"Optimized 24h schedule for {request.scenario_id}: Total Grid = {total_grid_kwh:.2f} kWh, "
         f"Total Cost = {total_cost_bdt:.2f} BDT, Peak Grid = {peak_grid_kwh:.2f} kWh. "
-        f"All {len(directives)} directives and battery neutrality satisfied."
+        f"{applied} applied directive(s) and battery neutrality satisfied."
     )
+    if dropped:
+        plan_summary += f" {len(dropped)} conflicting directive(s) downgraded to no_op."
 
     return hourly_plan, total_grid_kwh, total_cost_bdt, peak_grid_kwh, plan_summary
 

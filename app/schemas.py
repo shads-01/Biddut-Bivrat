@@ -167,7 +167,7 @@ class DirectiveInterpretation(BaseModel):
 # --- Request Models ---
 
 class HourEntry(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
     hour: int = Field(..., ge=0, le=23)
     demand_kwh: float = Field(..., ge=0.0)
     solar_kwh: float = Field(..., ge=0.0)
@@ -182,7 +182,7 @@ class HourEntry(BaseModel):
 
 
 class Battery(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
     capacity_kwh: float = Field(..., gt=0.0)
     initial_energy_kwh: float = Field(..., ge=0.0)
     minimum_energy_kwh: float = Field(..., ge=0.0)
@@ -201,7 +201,7 @@ class Battery(BaseModel):
 
 
 class OptimizeRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
     scenario_id: str = Field(..., min_length=1)
     operator_notes: List[str] = Field(..., min_length=1, max_length=3)
     hours: List[HourEntry] = Field(..., min_length=24, max_length=24)

@@ -133,6 +133,58 @@ def extract_hours_window(text: str) -> Optional[List[int]]:
     return None
 
 
+_PCT = r"(\d+(?:\.\d+)?)\s*(?:%|percent|per cent)"
+_LEADIN = r"(?:(?:about|around|approximately|roughly|nearly|only|just)\W+)?"
+_REDUCTION_VERB = r"(?:reduc\w*|cut|drop\w*|decreas\w*|lower\w*|fall\w*|los[et]\w*)"
+_FRACTIONS = {
+    "three quarters": 0.75, "three-quarters": 0.75, "three fourths": 0.75,
+    "two thirds": 2 / 3, "two-thirds": 2 / 3,
+    "one quarter": 0.25, "a quarter": 0.25, "one fourth": 0.25, "one-fourth": 0.25,
+    "one third": 1 / 3, "a third": 1 / 3, "one-third": 1 / 3,
+    "one fifth": 0.2, "one-fifth": 0.2, "a fifth": 0.2,
+    "one tenth": 0.1, "one-tenth": 0.1, "a tenth": 0.1,
+}
+
+
+def _solar_factor(lower: str) -> Optional[float]:
+    """Usable fraction of solar left (0..1) from a solar note, or None when no amount is stated.
+
+    Never invents an amount: an unreadable note returns None and stays no_op.
+    """
+    if "offline" in lower or "no solar" in lower or "zero solar" in lower:
+        return 0.0
+    if "halve" in lower or "half" in lower:
+        return 0.5
+
+    # "drop to about 20%", "roughly 25% of the forecast", "only 30 percent usable" -> amount that remains
+    m = re.search(
+        r"(?:roughly|treated as|remains?|keeps?|drops? to|falls? to|reduced to|down to|leaves?|leaving|only)\W+"
+        + _LEADIN + _PCT,
+        lower,
+    )
+    if m:
+        return max(0.0, min(1.0, float(m.group(1)) / 100.0))
+
+    # "cut by 60 percent", "reduction of 30%", "80% reduction" -> amount removed
+    m = re.search(_REDUCTION_VERB + r"\b(?:\W+\w+){0,5}?\W+(?:by|of)\W+" + _LEADIN + _PCT, lower)
+    if not m:
+        m = re.search(_PCT + r"\s*(?:haze|cloud|reduction|cut|drop|decrease|loss)", lower)
+    if not m:
+        m = re.search(r"(?:reduction|decrease|drop|loss)\s+of\W+" + _LEADIN + _PCT, lower)
+    if m:
+        return max(0.0, min(1.0, 1.0 - float(m.group(1)) / 100.0))
+
+    # Spoken fractions: "three quarters ... usable" remains, "reduced by a quarter" is removed
+    for phrase in sorted(_FRACTIONS, key=len, reverse=True):
+        found = re.search(r"\b" + re.escape(phrase) + r"\b", lower)
+        if found:
+            fraction = _FRACTIONS[phrase]
+            removed = re.search(_REDUCTION_VERB + r"\b(?:\W+\w+){0,5}?\W+(?:by|of)\W+" + _LEADIN + r"$", lower[: found.start()])
+            return 1.0 - fraction if removed else fraction
+
+    return None
+
+
 def parse_operator_note_fallback(
     note_text: str,
     note_index: int,
@@ -162,36 +214,17 @@ def parse_operator_note_fallback(
     solar_keywords = ["solar", "panel", "panels", "pv", "sun", "rooftop"]
     has_solar = any(k in lower for k in solar_keywords)
 
-    if has_solar and hours and any(w in lower for w in ["reduc", "curtail", "cut", "drop", "wash", "clean", "offline", "forecast", "haze", "cloud", "storm", "dust", "halved", "half"]):
-        factor = 0.0
-        if "offline" in lower or "no solar" in lower or "zero solar" in lower:
-            factor = 0.0
-        elif "halved" in lower or "half" in lower:
-            factor = 0.5
-        else:
-            # Check "roughly X% of the forecast" or "remains X%" or "drop to X%"
-            m_remain = re.search(r"(?:roughly|treated as|remains?|keep|drop to|fall to)\s*(\d+)\s*%", lower)
-            if m_remain:
-                factor = max(0.0, min(1.0, float(m_remain.group(1)) / 100.0))
-            else:
-                # Check "X% haze", "X% cloud", "reduced by X%" or "X% reduction" or "cut by X%"
-                m_cut = re.search(r"(\d+)\s*%\s*(?:haze|cloud|reduction|cut|drop)", lower)
-                if not m_cut:
-                    m_cut = re.search(r"(?:reduc\w+|cut|drop\w*)\s*(?:by)?\s*(\d+)\s*%", lower)
-                if m_cut:
-                    pct = float(m_cut.group(1))
-                    factor = max(0.0, min(1.0, 1.0 - (pct / 100.0)))
-                else:
-                    # Default generic reduction if percentage missing
-                    factor = 0.2
+    if has_solar and hours and any(w in lower for w in ["reduc", "curtail", "cut", "drop", "fall", "wash", "clean", "offline", "forecast", "haze", "cloud", "storm", "dust", "halve", "half"]):
+        factor = _solar_factor(lower)
 
-        return {
-            "note_index": note_index,
-            "applies": True,
-            "directive_type": "solar_reduction",
-            "structured_adjustment": {"hours": hours, "factor": round(factor, 4)},
-            "explanation": f"Fallback rule: parsed solar reduction to factor {factor:.2f} during hours {hours}",
-        }
+        if factor is not None:
+            return {
+                "note_index": note_index,
+                "applies": True,
+                "directive_type": "solar_reduction",
+                "structured_adjustment": {"hours": hours, "factor": round(factor, 4)},
+                "explanation": f"Fallback rule: parsed solar reduction to factor {factor:.2f} during hours {hours}",
+            }
 
     # 2. No Discharge Window (Check before charge window to avoid substring collisions)
     discharge_keywords = [
@@ -254,9 +287,8 @@ def parse_operator_note_fallback(
                 unit = m_val.group(2)
                 min_kwh = val * 1000.0 if unit == "mwh" else val
 
-        if min_kwh is not None:
-            # Cap to battery capacity
-            min_kwh = min(min_kwh, cap)
+        # A reserve above battery capacity is invalid (Problem Statement section 8): reject, never clamp
+        if min_kwh is not None and min_kwh <= cap + 1e-9:
             return {
                 "note_index": note_index,
                 "applies": True,

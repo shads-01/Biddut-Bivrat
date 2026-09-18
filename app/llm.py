@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -419,6 +420,49 @@ def _convert_window_to_hours(window: Optional[Dict[str, Any]]) -> List[int]:
         return sorted(list(set(wrapped)))
 
 
+def _finite_number(value: Any) -> Optional[float]:
+    """Returns value as a finite float, or None for bools, non-numbers, NaN and infinity."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _no_op(note_index: int, explanation: str) -> Dict[str, Any]:
+    return {
+        "note_index": note_index,
+        "applies": False,
+        "directive_type": "no_op",
+        "structured_adjustment": None,
+        "explanation": explanation,
+    }
+
+
+def _salvage_or_no_op(
+    d_type: str,
+    hours: List[int],
+    note_text: str,
+    note_index: int,
+    cap: float,
+    reasoning: str,
+    problem: str,
+) -> Dict[str, Any]:
+    """The model picked a directive type and window but gave no usable number.
+
+    Never invent one. The deterministic parser may supply the number only when it agrees with
+    the model on both type and hours; otherwise the note is left as no_op.
+    """
+    fallback = parse_operator_note_fallback(note_text, note_index, cap)
+    adjustment = fallback.get("structured_adjustment") or {}
+    if fallback.get("directive_type") == d_type and adjustment.get("hours") == hours:
+        return fallback
+    logger.warning(f"Note {note_index}: {d_type} dropped to no_op ({problem})")
+    return _no_op(note_index, f"{reasoning} ({problem}; not applied)")
+
+
 def assemble_directive_from_primitive(
     raw_item: Dict[str, Any],
     note_text: str,
@@ -463,21 +507,15 @@ def assemble_directive_from_primitive(
         }
 
     if d_type == "solar_reduction":
-        red_type = raw_item.get("reduction_type", "remaining")
-        pct = raw_item.get("percent")
-        if pct is None:
-            pct = 20.0
-        try:
-            pct = float(pct)
-        except (ValueError, TypeError):
-            pct = 20.0
+        red_type = raw_item.get("reduction_type")
+        pct = _finite_number(raw_item.get("percent"))
+        if red_type not in ("remaining", "reduced_by") or pct is None or not 0.0 <= pct <= 100.0:
+            return _salvage_or_no_op(
+                d_type, hours, note_text, note_index, cap, reasoning,
+                "reduction type or percent missing or out of range",
+            )
 
-        if red_type == "remaining":
-            factor = pct / 100.0
-        else:
-            factor = 1.0 - (pct / 100.0)
-
-        factor = max(0.0, min(1.0, factor))
+        factor = pct / 100.0 if red_type == "remaining" else 1.0 - pct / 100.0
         return {
             "note_index": note_index,
             "applies": True,
@@ -487,14 +525,15 @@ def assemble_directive_from_primitive(
         }
 
     elif d_type == "minimum_battery_reserve":
-        val_obj = raw_item.get("value") or {}
-        num = val_obj.get("number", 0.0)
-        unit = str(val_obj.get("unit", "kwh")).lower()
-
-        try:
-            num = float(num)
-        except (ValueError, TypeError):
-            num = 0.0
+        val_obj = raw_item.get("value")
+        val_obj = val_obj if isinstance(val_obj, dict) else {}
+        num = _finite_number(val_obj.get("number"))
+        unit = str(val_obj.get("unit") or "kwh").lower()
+        if num is None or num < 0.0 or unit not in ("kwh", "mwh", "percent_of_capacity"):
+            return _salvage_or_no_op(
+                d_type, hours, note_text, note_index, cap, reasoning,
+                "reserve amount or unit missing or invalid",
+            )
 
         if unit == "mwh":
             min_kwh = num * 1000.0
@@ -503,9 +542,12 @@ def assemble_directive_from_primitive(
         else:
             min_kwh = num
 
-        min_kwh = max(0.0, min_kwh)
-        if min_kwh > cap:
-            min_kwh = cap
+        if min_kwh > cap + 1e-9:
+            # Problem Statement section 8: a reserve may not exceed capacity. Reject, never clamp.
+            return _no_op(
+                note_index,
+                f"{reasoning} (reserve {min_kwh:.2f} kWh exceeds battery capacity {cap:.2f} kWh; not applied)",
+            )
 
         return {
             "note_index": note_index,
@@ -525,12 +567,14 @@ def assemble_directive_from_primitive(
         }
 
     elif d_type == "max_grid_window":
-        val_obj = raw_item.get("value") or {}
-        num = val_obj.get("number", 0.0)
-        try:
-            max_grid = max(0.0, float(num))
-        except (ValueError, TypeError):
-            max_grid = 0.0
+        val_obj = raw_item.get("value")
+        val_obj = val_obj if isinstance(val_obj, dict) else {}
+        max_grid = _finite_number(val_obj.get("number"))
+        if max_grid is None or max_grid < 0.0:
+            return _salvage_or_no_op(
+                d_type, hours, note_text, note_index, cap, reasoning,
+                "grid cap missing or invalid",
+            )
 
         return {
             "note_index": note_index,
@@ -688,9 +732,7 @@ def call_llm_for_interpretations(
             parse_operator_note_fallback(note, idx, battery_capacity_kwh)
             for idx, note in enumerate(operator_notes)
         ]
-        result_json = json.dumps({"interpretations": assembled_directives})
-        _INTERPRETATION_CACHE[cache_key] = result_json
-        return result_json
+        return json.dumps({"interpretations": assembled_directives})
 
     # 3. Prepare payload
     user_payload = {
@@ -741,11 +783,10 @@ def call_llm_for_interpretations(
         try:
             parsed = json.loads(raw_content)
             items = parsed.get("interpretations", [])
-            items_by_idx = {
-                item.get("note_index"): item
-                for item in items
-                if isinstance(item, dict) and "note_index" in item
-            }
+            items_by_idx: Dict[Any, Dict[str, Any]] = {}
+            for item in items:
+                if isinstance(item, dict) and "note_index" in item:
+                    items_by_idx.setdefault(item["note_index"], item)  # first entry wins on duplicates
 
             for idx in range(total_notes):
                 if idx in items_by_idx:
@@ -766,7 +807,9 @@ def call_llm_for_interpretations(
             logger.error(f"Error parsing LLM primitives: {e}. Degrading to fallback parser.")
             assembled_directives = []
 
-    # 6. Fallback if no LLM output could be generated
+    # 6. Fallback if no LLM output could be generated. Only real LLM answers are cached, so a
+    # rate-limit burst cannot leave regex guesses cached after the provider recovers.
+    answered_by_llm = bool(assembled_directives)
     if not assembled_directives:
         logger.info("Executing deterministic fallback parser for operator notes.")
         assembled_directives = [
@@ -775,5 +818,6 @@ def call_llm_for_interpretations(
         ]
 
     result_json = json.dumps({"interpretations": assembled_directives})
-    _INTERPRETATION_CACHE[cache_key] = result_json
+    if answered_by_llm:
+        _INTERPRETATION_CACHE[cache_key] = result_json
     return result_json

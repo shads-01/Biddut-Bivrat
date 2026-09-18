@@ -1,4 +1,4 @@
-"""LLM client, prompt orchestration, and primitive assembly for GridWise operator notes."""
+"""LLM client, prompt orchestration, multi-key cycling pool, and primitive assembly for GridWise operator notes."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -20,6 +22,121 @@ logger = logging.getLogger("gridwise.llm")
 
 # In-memory LRU-style cache for repeated operator note queries
 _INTERPRETATION_CACHE: Dict[str, str] = {}
+
+
+class KeyCycler:
+    """Manages a pool of API keys with round-robin cycling, concurrency safety,
+
+    and rate-limit cooldown tracking.
+    """
+
+    def __init__(self, provider: str, base_url: str, default_model: str, timeout: float = 8.0):
+        self.provider = provider
+        self.base_url = base_url
+        self.default_model = default_model
+        self.timeout = timeout
+        self._lock = threading.Lock()
+        self._index = 0
+        self._cooldowns: Dict[str, float] = {}
+
+    def mark_cooldown(self, key: str, duration_seconds: float = 60.0):
+        """Marks a key as temporarily unavailable due to rate limits or errors."""
+        with self._lock:
+            self._cooldowns[key] = time.time() + duration_seconds
+            masked = f"{key[:6]}...{key[-4:]}" if len(key) >= 12 else "***"
+            logger.warning(f"[{self.provider}] Key {masked} put on cooldown for {duration_seconds}s.")
+
+    def get_ordered_free_keys(self, all_keys: List[str]) -> List[str]:
+        """Returns currently free (non-cooldown) keys ordered from current round-robin index."""
+        now = time.time()
+        with self._lock:
+            # Clean expired cooldowns
+            expired = [k for k, exp in self._cooldowns.items() if exp <= now]
+            for k in expired:
+                del self._cooldowns[k]
+
+            if not all_keys:
+                return []
+
+            n = len(all_keys)
+            start_idx = self._index % n
+            # Order all keys starting from current pointer
+            candidate_keys = [all_keys[(start_idx + i) % n] for i in range(n)]
+            free_keys = [k for k in candidate_keys if self._cooldowns.get(k, 0.0) <= now]
+
+            # Advance index for the next call
+            self._index = (self._index + 1) % n
+            return free_keys
+
+
+# Global cyclers for Groq and OpenRouter
+_GROQ_CYCLER = KeyCycler(
+    provider="Groq",
+    base_url="https://api.groq.com/openai/v1",
+    default_model=os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b").strip() or "qwen/qwen3.8-27b",
+    timeout=8.0,
+)
+
+_OPENROUTER_CYCLER = KeyCycler(
+    provider="OpenRouter",
+    base_url="https://openrouter.ai/api/v1",
+    default_model=os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free").strip() or "meta-llama/llama-3.3-70b-instruct:free",
+    timeout=12.0,
+)
+
+
+def get_all_groq_keys() -> List[str]:
+    """Discovers all available Groq API keys from environment.
+
+    Supports GROQ_API_KEY, GROQ_API_KEY_1, GROQ_API_KEY_2, GROQ_API_KEY_3, etc.,
+    or comma-separated values in GROQ_API_KEY.
+    """
+    keys: List[str] = []
+
+    # Check numbered keys sorted (e.g. GROQ_API_KEY_1, GROQ_API_KEY_2)
+    numbered_items = sorted(
+        [(k, v.strip()) for k, v in os.environ.items() if re.match(r"^GROQ_API_KEY_\d+$", k, re.IGNORECASE)],
+        key=lambda item: int(re.search(r"\d+", item[0]).group()),
+    )
+    for _, val in numbered_items:
+        if val and val not in keys:
+            keys.append(val)
+
+    # Check base GROQ_API_KEY (can be single key or comma-separated)
+    base_val = os.environ.get("GROQ_API_KEY", "").strip()
+    if base_val:
+        for k in base_val.split(","):
+            cleaned = k.strip()
+            if cleaned and cleaned not in keys:
+                keys.append(cleaned)
+
+    return keys
+
+
+def get_all_openrouter_keys() -> List[str]:
+    """Discovers all available OpenRouter API keys from environment.
+
+    Supports OPENROUTER_API_KEY, OPENROUTER_API_KEY_1, OPENROUTER_API_KEY_2, etc.,
+    or comma-separated values in OPENROUTER_API_KEY.
+    """
+    keys: List[str] = []
+
+    numbered_items = sorted(
+        [(k, v.strip()) for k, v in os.environ.items() if re.match(r"^OPENROUTER_API_KEY_\d+$", k, re.IGNORECASE)],
+        key=lambda item: int(re.search(r"\d+", item[0]).group()),
+    )
+    for _, val in numbered_items:
+        if val and val not in keys:
+            keys.append(val)
+
+    base_val = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if base_val:
+        for k in base_val.split(","):
+            cleaned = k.strip()
+            if cleaned and cleaned not in keys:
+                keys.append(cleaned)
+
+    return keys
 
 
 SYSTEM_PROMPT = """You are an expert power systems operator assistant in the GridWise energy management system.
@@ -259,35 +376,6 @@ def _get_cache_key(operator_notes: List[str]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def get_llm_client() -> Tuple[Optional[OpenAI], str]:
-    """Returns an active LLM client and model name.
-
-    Priority:
-    1. Groq (primary, ultra-fast Llama 3.3 70B)
-    2. OpenRouter (fallback)
-    """
-    groq_key = os.environ.get("GROQ_API_KEY", "").strip()
-    if groq_key:
-        client = OpenAI(
-            base_url="https://api.groq.com/openai/v1",
-            api_key=groq_key,
-            timeout=8.0,
-        )
-        return client, "llama-3.3-70b-versatile"
-
-    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if openrouter_key:
-        model = os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free").strip()
-        client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=openrouter_key,
-            timeout=12.0,
-        )
-        return client, model
-
-    return None, ""
-
-
 def _convert_window_to_hours(window: Optional[Dict[str, Any]]) -> List[int]:
     """Converts a window primitive {start_hour, end_hour} into a sorted list of unique ints 0..23."""
     if not window or not isinstance(window, dict):
@@ -449,6 +537,78 @@ def assemble_directive_from_primitive(
     }
 
 
+def _try_call_provider(
+    cycler: KeyCycler,
+    keys: List[str],
+    user_content: str,
+) -> Optional[str]:
+    """Attempts to call the provider by cycling through free available keys.
+
+    If a key hits rate limits or errors, it is put on cooldown and the next free
+    key is tried immediately.
+    """
+    free_keys = cycler.get_ordered_free_keys(keys)
+    if not free_keys:
+        return None
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+
+    for key in free_keys:
+        try:
+            client = OpenAI(
+                base_url=cycler.base_url,
+                api_key=key,
+                timeout=cycler.timeout,
+            )
+
+            # Try request with 1 prompt retry on JSON format issue
+            cur_messages = list(messages)
+            for attempt in range(2):
+                try:
+                    response = client.chat.completions.create(
+                        model=cycler.default_model,
+                        messages=cur_messages,
+                        response_format={"type": "json_object"},
+                        temperature=0.0,
+                    )
+                    content = response.choices[0].message.content
+                    if content:
+                        parsed = json.loads(content)
+                        if "interpretations" in parsed:
+                            return content
+                except Exception as inner_err:
+                    err_str = str(inner_err).lower()
+                    # Check for rate limit or quota
+                    if "429" in err_str or "rate limit" in err_str or "quota" in err_str:
+                        cycler.mark_cooldown(key, duration_seconds=60.0)
+                        break  # Break inner loop to try next key
+                    elif "401" in err_str or "unauthorized" in err_str or "authentication" in err_str:
+                        cycler.mark_cooldown(key, duration_seconds=300.0)
+                        break
+
+                    if attempt == 0 and "json" in err_str:
+                        cur_messages.append({
+                            "role": "user",
+                            "content": f"Previous response had format error: {str(inner_err)}. Please output valid JSON with 'interpretations' array.",
+                        })
+                    else:
+                        logger.warning(f"[{cycler.provider}] Call error on attempt {attempt + 1}: {inner_err}")
+                        break
+
+        except Exception as outer_err:
+            err_str = str(outer_err).lower()
+            if "429" in err_str or "rate limit" in err_str:
+                cycler.mark_cooldown(key, duration_seconds=60.0)
+            else:
+                cycler.mark_cooldown(key, duration_seconds=20.0)
+            logger.warning(f"[{cycler.provider}] Key error: {outer_err}. Rotating to next key.")
+
+    return None
+
+
 def call_llm_for_interpretations(
     operator_notes: List[str],
     battery_capacity_kwh: Optional[float] = None,
@@ -456,11 +616,11 @@ def call_llm_for_interpretations(
     """Interprets operator notes into validated directive JSON string.
 
     Pipeline:
-    1. Check cache.
-    2. Try LLM (Groq -> OpenRouter) to extract primitives with 1 retry on error.
-    3. Assemble primitives into canonical directives in Python.
-    4. Fall back to regex parser if LLM unavailable or unparseable.
-    5. Returns JSON string {"interpretations": [...]}.
+    1. Check in-memory hash cache.
+    2. Cycle through free Groq keys (Groq primary).
+    3. If Groq exhausted/cooldown, cycle through free OpenRouter keys (fallback).
+    4. Assemble primitives into canonical directives.
+    5. If all LLM calls fail, fall back to deterministic regex parser.
     """
     total_notes = len(operator_notes)
     if total_notes == 0:
@@ -485,39 +645,20 @@ def call_llm_for_interpretations(
         f"{json.dumps(user_payload, indent=2)}"
     )
 
-    client, model_name = get_llm_client()
     raw_content: Optional[str] = None
 
-    if client is not None:
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ]
+    # 3. Try Groq key pool
+    groq_keys = get_all_groq_keys()
+    if groq_keys:
+        raw_content = _try_call_provider(_GROQ_CYCLER, groq_keys, user_content)
 
-        # Attempt call with 1 retry on failure
-        for attempt in range(2):
-            try:
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=messages,
-                    response_format={"type": "json_object"},
-                    temperature=0.0,
-                )
-                raw_content = response.choices[0].message.content
-                if raw_content:
-                    # Quick parse check
-                    test_data = json.loads(raw_content)
-                    if "interpretations" in test_data:
-                        break
-            except Exception as e:
-                logger.warning(f"LLM call attempt {attempt + 1} failed: {e}")
-                if attempt == 0:
-                    messages.append({
-                        "role": "user",
-                        "content": f"The previous response failed with error: {str(e)}. Please output valid JSON matching the schema.",
-                    })
+    # 4. If Groq unavailable/failed, try OpenRouter key pool
+    if not raw_content:
+        or_keys = get_all_openrouter_keys()
+        if or_keys:
+            raw_content = _try_call_provider(_OPENROUTER_CYCLER, or_keys, user_content)
 
-    # 3. Parse LLM output into primitives if available
+    # 5. Parse primitives & assemble directives
     assembled_directives: List[Dict[str, Any]] = []
 
     if raw_content:
@@ -540,7 +681,6 @@ def call_llm_for_interpretations(
                     )
                     assembled_directives.append(assembled)
                 else:
-                    # Missing from LLM response -> fallback
                     fallback = parse_operator_note_fallback(
                         operator_notes[idx], idx, battery_capacity_kwh
                     )
@@ -550,7 +690,7 @@ def call_llm_for_interpretations(
             logger.error(f"Error parsing LLM primitives: {e}. Degrading to fallback parser.")
             assembled_directives = []
 
-    # 4. If LLM produced no directives, run fallback parser for all notes
+    # 6. Fallback if no LLM output could be generated
     if not assembled_directives:
         logger.info("Executing deterministic fallback parser for operator notes.")
         assembled_directives = [

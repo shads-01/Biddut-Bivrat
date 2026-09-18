@@ -199,3 +199,31 @@ def test_public_sample_cases():
         validated = OptimizeResponse.model_validate(data)
         assert len(validated.hourly_plan) == 24
         assert validated.scenario_id == case_data["scenario_id"]
+
+
+def test_endpoint_passes_battery_capacity_to_llm():
+    """Percent-of-capacity reserves need the scenario's real capacity, not a default."""
+    payload = generate_sample_scenario("capacity_passthrough")
+    payload["battery"]["capacity_kwh"] = 200.0
+    with patch("app.main.call_llm_for_interpretations", return_value=None) as mock_llm:
+        response = client.post("/optimize-energy", json=payload)
+    assert response.status_code == 200
+    mock_llm.assert_called_once_with(payload["operator_notes"], 200.0)
+
+
+def test_percent_reserve_resolves_against_capacity_and_cache_is_per_capacity():
+    """50% of a 200 kWh battery is 100 kWh; the same notes on a 400 kWh battery is 200 kWh."""
+    import app.llm as llm
+
+    note = [
+        "Keep at least 50% of the battery capacity stored in the battery "
+        "from 6 PM until 9 PM for emergency operations."
+    ]
+    llm._INTERPRETATION_CACHE.clear()
+    with patch.object(llm, "get_llm_client", return_value=(None, "")):
+        small = json.loads(llm.call_llm_for_interpretations(note, 200.0))
+        large = json.loads(llm.call_llm_for_interpretations(note, 400.0))
+    llm._INTERPRETATION_CACHE.clear()
+
+    assert small["interpretations"][0]["structured_adjustment"]["minimum_energy_kwh"] == 100.0
+    assert large["interpretations"][0]["structured_adjustment"]["minimum_energy_kwh"] == 200.0

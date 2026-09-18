@@ -110,12 +110,22 @@ pytest tests/test_contract.py -k test_public_sample_cases -v
 
 ---
 
+## Live Deployment (Judge Access)
+
+The service is deployed and publicly accessible 24/7 without authentication, VPN, or login:
+- **Base URL**: `https://biddut-bivrat.vercel.app`
+- **Health Check**: `https://biddut-bivrat.vercel.app/health`
+- **Optimization Endpoint**: `https://biddut-bivrat.vercel.app/optimize-energy`
+
+---
+
 ## API Endpoints & Usage
 
 ### 1. `GET /health`
 Verifies service uptime and returns within 60s of container start.
 ```bash
-curl -X GET http://localhost:8080/health
+curl -X GET https://biddut-bivrat.vercel.app/health
+# Or locally: curl -X GET http://localhost:8080/health
 ```
 **Response (200 OK):**
 ```json
@@ -127,7 +137,7 @@ Calculates the optimal cost-minimized schedule.
 
 **Example Request:**
 ```bash
-curl -X POST http://localhost:8080/optimize-energy \
+curl -X POST https://biddut-bivrat.vercel.app/optimize-energy \
   -H "Content-Type: application/json" \
   -d '{
     "scenario_id": "demo_scenario_01",

@@ -168,7 +168,7 @@ def _solar_factor(lower: str) -> Optional[float]:
     # "cut by 60 percent", "reduction of 30%", "80% reduction" -> amount removed
     m = re.search(_REDUCTION_VERB + r"\b(?:\W+\w+){0,5}?\W+(?:by|of)\W+" + _LEADIN + _PCT, lower)
     if not m:
-        m = re.search(_PCT + r"\s*(?:haze|cloud|reduction|cut|drop|decrease|loss)", lower)
+        m = re.search(_PCT + r"\s*(?:\w+\s+){0,2}?(?:haze|cloud|reduction|cut|drop|decrease|loss)", lower)
     if not m:
         m = re.search(r"(?:reduction|decrease|drop|loss)\s+of\W+" + _LEADIN + _PCT, lower)
     if m:

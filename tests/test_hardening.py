@@ -271,3 +271,15 @@ def test_fallback_reads_common_solar_wordings(note, hours, factor):
 ])
 def test_solar_wording_does_not_hijack_other_directives(note):
     assert parse_operator_note_fallback(note, 0, 500.0)["directive_type"] != "solar_reduction"
+
+
+@pytest.mark.parametrize("note,hours,factor", [
+    ("Heavy dust storm expected from 1 PM to 3 PM; expect 80% solar reduction.", [13, 14], 0.2),
+    ("Expect an 80 percent rooftop solar reduction from 1 PM to 3 PM.", [13, 14], 0.2),
+    ("A 50% PV output cut is planned from 9 AM to 11 AM.", [9, 10], 0.5),
+])
+def test_fallback_reads_percent_followed_by_words_then_reduction(note, hours, factor):
+    result = parse_operator_note_fallback(note, 0, 200.0)
+    assert result["directive_type"] == "solar_reduction", result
+    assert result["structured_adjustment"] == {"hours": hours, "factor": pytest.approx(factor, abs=1e-4)}
+

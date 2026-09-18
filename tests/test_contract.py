@@ -168,23 +168,34 @@ def test_malformed_json_returns_400():
 
 
 def test_public_sample_cases():
-    """Runs all cases from tests/public_sample_cases.json if present; skips if empty."""
-    cases_file = Path(__file__).parent / "public_sample_cases.json"
+    """Runs all cases from BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json or public_sample_cases.json."""
+    official_file = Path(__file__).parent / "BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json"
+    fallback_file = Path(__file__).parent / "public_sample_cases.json"
+    cases_file = official_file if official_file.exists() else fallback_file
+
     if not cases_file.exists():
-        pytest.skip("public_sample_cases.json does not exist")
+        pytest.skip("No sample cases file exists")
 
     try:
         with open(cases_file, "r", encoding="utf-8") as f:
-            cases = json.load(f)
+            raw_data = json.load(f)
     except Exception:
-        pytest.skip("Could not read public_sample_cases.json")
+        pytest.skip(f"Could not read {cases_file.name}")
 
-    if not cases or not isinstance(cases, list) or len(cases) == 0:
-        pytest.skip("public_sample_cases.json is currently empty (placeholder)")
+    if isinstance(raw_data, dict) and "cases" in raw_data:
+        case_items = [c.get("input", c) for c in raw_data["cases"]]
+    elif isinstance(raw_data, list):
+        case_items = raw_data
+    else:
+        case_items = []
 
-    for case_idx, case_data in enumerate(cases):
+    if not case_items:
+        pytest.skip(f"{cases_file.name} is currently empty")
+
+    for case_idx, case_data in enumerate(case_items):
         response = client.post("/optimize-energy", json=case_data)
         assert response.status_code == 200, f"Case {case_idx} failed: {response.text}"
         data = response.json()
         validated = OptimizeResponse.model_validate(data)
         assert len(validated.hourly_plan) == 24
+        assert validated.scenario_id == case_data["scenario_id"]

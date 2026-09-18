@@ -134,13 +134,19 @@ def solve_energy_schedule(
             cat=pulp.LpContinuous,
         )
 
-    # Objective function: minimize sum(grid_kwh[h] * tariff_bdt[h]) + small tie-breaker
+    peak_grid_var = pulp.LpVariable("peak_grid", lowBound=0.0, cat=pulp.LpContinuous)
+    for h in range(24):
+        prob += (peak_grid_var >= grid_vars[h], f"Peak_Grid_Bound_{h}")
+
+    # Objective function: minimize sum(grid_kwh[h] * tariff_bdt[h]) + small tie-breakers
     # Tie-breaker (1e-6) on charge+discharge prevents simultaneous charging & discharging degeneracy
+    # Tie-breaker (1e-5) on peak_grid selects the lowest peak when multiple schedules have identical cost
     prob += (
         pulp.lpSum(
             grid_vars[h] * hours_map[h].tariff_bdt_per_kwh + 1e-6 * (charge_vars[h] + discharge_vars[h])
             for h in range(24)
-        ),
+        )
+        + 1e-5 * peak_grid_var,
         "Total_Cost_Objective",
     )
 

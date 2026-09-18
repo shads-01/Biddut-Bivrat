@@ -562,6 +562,7 @@ def _try_call_provider(
                 base_url=cycler.base_url,
                 api_key=key,
                 timeout=cycler.timeout,
+                max_retries=0,
             )
 
             # Try request with 1 prompt retry on JSON format issue

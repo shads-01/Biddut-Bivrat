@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
+from dotenv import load_dotenv
 from openai import OpenAI
 
 from app.fallback_parser import parse_operator_note_fallback
 
+# Automatically load .env if present
+load_dotenv()
+
 logger = logging.getLogger("gridwise.llm")
+
+# In-memory LRU-style cache for repeated operator note queries
+_INTERPRETATION_CACHE: Dict[str, str] = {}
+
 
 SYSTEM_PROMPT = """You are an expert power systems operator assistant in the GridWise energy management system.
 Your task is to analyze 1 to 3 natural-language operator notes and extract operational directive primitives.
@@ -244,6 +253,12 @@ Output:
 """
 
 
+def _get_cache_key(operator_notes: List[str]) -> str:
+    """Computes a stable hash key for a list of operator notes."""
+    raw = json.dumps([n.strip().lower() for n in operator_notes], sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def get_llm_client() -> Tuple[Optional[OpenAI], str]:
     """Returns an active LLM client and model name.
 
@@ -290,6 +305,7 @@ def _convert_window_to_hours(window: Optional[Dict[str, Any]]) -> List[int]:
     except (ValueError, TypeError):
         return []
 
+    # Clamp endpoints
     start = max(0, min(24, start))
     end = max(0, min(24, end))
 
@@ -298,6 +314,7 @@ def _convert_window_to_hours(window: Optional[Dict[str, Any]]) -> List[int]:
     elif start < end:
         return list(range(start, end))
     else:
+        # Midnight wrap-around (e.g., 22 to 2)
         wrapped = list(range(start, 24)) + list(range(0, end))
         return sorted(list(set(wrapped)))
 
@@ -333,6 +350,7 @@ def assemble_directive_from_primitive(
 
     hours = _convert_window_to_hours(raw_item.get("window"))
     if not hours:
+        # If no valid hours found for an operational directive, fallback to regex
         fallback = parse_operator_note_fallback(note_text, note_index, cap)
         if fallback.get("applies"):
             return fallback
@@ -435,11 +453,26 @@ def call_llm_for_interpretations(
     operator_notes: List[str],
     battery_capacity_kwh: Optional[float] = None,
 ) -> Optional[str]:
-    """Interprets operator notes into validated directive JSON string."""
+    """Interprets operator notes into validated directive JSON string.
+
+    Pipeline:
+    1. Check cache.
+    2. Try LLM (Groq -> OpenRouter) to extract primitives with 1 retry on error.
+    3. Assemble primitives into canonical directives in Python.
+    4. Fall back to regex parser if LLM unavailable or unparseable.
+    5. Returns JSON string {"interpretations": [...]}.
+    """
     total_notes = len(operator_notes)
     if total_notes == 0:
         return json.dumps({"interpretations": []})
 
+    # 1. Check cache
+    cache_key = _get_cache_key(operator_notes)
+    if cache_key in _INTERPRETATION_CACHE:
+        logger.info(f"Cache hit for operator notes hash: {cache_key[:8]}")
+        return _INTERPRETATION_CACHE[cache_key]
+
+    # 2. Prepare payload
     user_payload = {
         "battery_capacity_kwh": battery_capacity_kwh or 500.0,
         "notes": [
@@ -461,6 +494,7 @@ def call_llm_for_interpretations(
             {"role": "user", "content": user_content},
         ]
 
+        # Attempt call with 1 retry on failure
         for attempt in range(2):
             try:
                 response = client.chat.completions.create(
@@ -471,6 +505,7 @@ def call_llm_for_interpretations(
                 )
                 raw_content = response.choices[0].message.content
                 if raw_content:
+                    # Quick parse check
                     test_data = json.loads(raw_content)
                     if "interpretations" in test_data:
                         break
@@ -482,6 +517,7 @@ def call_llm_for_interpretations(
                         "content": f"The previous response failed with error: {str(e)}. Please output valid JSON matching the schema.",
                     })
 
+    # 3. Parse LLM output into primitives if available
     assembled_directives: List[Dict[str, Any]] = []
 
     if raw_content:
@@ -504,6 +540,7 @@ def call_llm_for_interpretations(
                     )
                     assembled_directives.append(assembled)
                 else:
+                    # Missing from LLM response -> fallback
                     fallback = parse_operator_note_fallback(
                         operator_notes[idx], idx, battery_capacity_kwh
                     )
@@ -513,6 +550,7 @@ def call_llm_for_interpretations(
             logger.error(f"Error parsing LLM primitives: {e}. Degrading to fallback parser.")
             assembled_directives = []
 
+    # 4. If LLM produced no directives, run fallback parser for all notes
     if not assembled_directives:
         logger.info("Executing deterministic fallback parser for operator notes.")
         assembled_directives = [
@@ -520,4 +558,6 @@ def call_llm_for_interpretations(
             for idx, note in enumerate(operator_notes)
         ]
 
-    return json.dumps({"interpretations": assembled_directives})
+    result_json = json.dumps({"interpretations": assembled_directives})
+    _INTERPRETATION_CACHE[cache_key] = result_json
+    return result_json

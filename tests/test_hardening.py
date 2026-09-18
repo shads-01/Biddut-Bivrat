@@ -283,3 +283,18 @@ def test_fallback_reads_percent_followed_by_words_then_reduction(note, hours, fa
     assert result["directive_type"] == "solar_reduction", result
     assert result["structured_adjustment"] == {"hours": hours, "factor": pytest.approx(factor, abs=1e-4)}
 
+
+@pytest.mark.parametrize("text,hours", [
+    ("during the 1-3 PM maintenance window", [13, 14]),
+    ("from 1 to 3 PM", [13, 14]),
+    ("between 8-10 PM tonight", [20, 21]),
+    ("from 10-2 PM", [10, 11, 12, 13]),
+    ("from 11-1 PM", [11, 12]),
+    ("from 9-11 AM", [9, 10]),
+    ("from 1 PM to 3 PM", [13, 14]),
+    ("from 13:00 to 15:00", [13, 14]),
+    ("from 10 PM to 2 AM", [0, 1, 22, 23]),
+])
+def test_fallback_time_windows_share_a_trailing_am_pm(text, hours):
+    from app.fallback_parser import extract_hours_window
+    assert extract_hours_window(text) == hours

@@ -370,9 +370,21 @@ Output:
 """
 
 
-def _get_cache_key(operator_notes: List[str]) -> str:
-    """Computes a stable hash key for a list of operator notes."""
-    raw = json.dumps([n.strip().lower() for n in operator_notes], sort_keys=True)
+def _get_cache_key(
+    operator_notes: List[str], battery_capacity_kwh: Optional[float] = None
+) -> str:
+    """Computes a stable hash key for operator notes plus battery capacity.
+
+    Capacity is part of the key because percent-of-capacity reserves resolve
+    to different kWh values for different batteries.
+    """
+    raw = json.dumps(
+        {
+            "notes": [n.strip().lower() for n in operator_notes],
+            "capacity_kwh": battery_capacity_kwh,
+        },
+        sort_keys=True,
+    )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -628,7 +640,7 @@ def call_llm_for_interpretations(
         return json.dumps({"interpretations": []})
 
     # 1. Check cache
-    cache_key = _get_cache_key(operator_notes)
+    cache_key = _get_cache_key(operator_notes, battery_capacity_kwh)
     if cache_key in _INTERPRETATION_CACHE:
         logger.info(f"Cache hit for operator notes hash: {cache_key[:8]}")
         return _INTERPRETATION_CACHE[cache_key]

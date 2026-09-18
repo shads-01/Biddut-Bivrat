@@ -97,7 +97,9 @@ async def optimize_energy(request: Request):
     # 3. Pipeline execution with safe controlled error handling (HTTP 500, no leaks)
     try:
         # Step A: LLM call to interpret operator notes (untrusted)
-        raw_llm_output = call_llm_for_interpretations(req.operator_notes)
+        raw_llm_output = call_llm_for_interpretations(
+            req.operator_notes, req.battery.capacity_kwh
+        )
 
         # Step B: Deterministic guardrails (validate & fail-safe to no_op)
         directives = validate_and_guard_interpretations(

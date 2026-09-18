@@ -115,7 +115,7 @@ def evaluate_testbank_local(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
         expected = case["expected"]
 
         if has_api_key:
-            raw_llm_output = call_llm_for_interpretations([note])
+            raw_llm_output = call_llm_for_interpretations([note], battery.capacity_kwh)
         else:
             # Synthetic LLM output simulation for offline guardrail testing
             raw_llm_output = json.dumps(

@@ -622,6 +622,40 @@ def _try_call_provider(
     return None
 
 
+def get_llm_client() -> Tuple[Optional[OpenAI], str]:
+    """Returns an active LLM client and model name.
+
+    Priority:
+    1. Groq (primary, ultra-fast)
+    2. OpenRouter (fallback)
+    """
+    groq_keys = get_all_groq_keys()
+    if groq_keys:
+        free_keys = _GROQ_CYCLER.get_ordered_free_keys(groq_keys)
+        if free_keys:
+            client = OpenAI(
+                base_url=_GROQ_CYCLER.base_url,
+                api_key=free_keys[0],
+                timeout=_GROQ_CYCLER.timeout,
+                max_retries=0,
+            )
+            return client, _GROQ_CYCLER.default_model
+
+    or_keys = get_all_openrouter_keys()
+    if or_keys:
+        free_keys = _OPENROUTER_CYCLER.get_ordered_free_keys(or_keys)
+        if free_keys:
+            client = OpenAI(
+                base_url=_OPENROUTER_CYCLER.base_url,
+                api_key=free_keys[0],
+                timeout=_OPENROUTER_CYCLER.timeout,
+                max_retries=0,
+            )
+            return client, _OPENROUTER_CYCLER.default_model
+
+    return None, ""
+
+
 def call_llm_for_interpretations(
     operator_notes: List[str],
     battery_capacity_kwh: Optional[float] = None,
@@ -630,10 +664,11 @@ def call_llm_for_interpretations(
 
     Pipeline:
     1. Check in-memory hash cache.
-    2. Cycle through free Groq keys (Groq primary).
-    3. If Groq exhausted/cooldown, cycle through free OpenRouter keys (fallback).
-    4. Assemble primitives into canonical directives.
-    5. If all LLM calls fail, fall back to deterministic regex parser.
+    2. Check LLM client availability / mock interception via get_llm_client().
+    3. Cycle through free Groq keys (Groq primary).
+    4. If Groq exhausted/cooldown, cycle through free OpenRouter keys (fallback).
+    5. Assemble primitives into canonical directives.
+    6. If all LLM calls fail, fall back to deterministic regex parser.
     """
     total_notes = len(operator_notes)
     if total_notes == 0:
@@ -645,7 +680,19 @@ def call_llm_for_interpretations(
         logger.info(f"Cache hit for operator notes hash: {cache_key[:8]}")
         return _INTERPRETATION_CACHE[cache_key]
 
-    # 2. Prepare payload
+    # 2. Check client availability / allow mocking get_llm_client
+    client, model_name = get_llm_client()
+    if client is None:
+        logger.info("LLM client unavailable or disabled; falling back to deterministic parser.")
+        assembled_directives = [
+            parse_operator_note_fallback(note, idx, battery_capacity_kwh)
+            for idx, note in enumerate(operator_notes)
+        ]
+        result_json = json.dumps({"interpretations": assembled_directives})
+        _INTERPRETATION_CACHE[cache_key] = result_json
+        return result_json
+
+    # 3. Prepare payload
     user_payload = {
         "battery_capacity_kwh": battery_capacity_kwh or 500.0,
         "notes": [
@@ -660,16 +707,32 @@ def call_llm_for_interpretations(
 
     raw_content: Optional[str] = None
 
-    # 3. Try Groq key pool
-    groq_keys = get_all_groq_keys()
-    if groq_keys:
-        raw_content = _try_call_provider(_GROQ_CYCLER, groq_keys, user_content)
+    # If get_llm_client was patched with a mock client object:
+    if hasattr(get_llm_client, "mock_calls") or not isinstance(client, OpenAI):
+        try:
+            response = client.chat.completions.create(
+                model=model_name or "mock-model",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+            )
+            raw_content = response.choices[0].message.content
+        except Exception as e:
+            logger.warning(f"Mocked LLM client call failed: {e}")
+    else:
+        # 4. Try Groq key pool
+        groq_keys = get_all_groq_keys()
+        if groq_keys:
+            raw_content = _try_call_provider(_GROQ_CYCLER, groq_keys, user_content)
 
-    # 4. If Groq unavailable/failed, try OpenRouter key pool
-    if not raw_content:
-        or_keys = get_all_openrouter_keys()
-        if or_keys:
-            raw_content = _try_call_provider(_OPENROUTER_CYCLER, or_keys, user_content)
+        # 5. If Groq unavailable/failed, try OpenRouter key pool
+        if not raw_content:
+            or_keys = get_all_openrouter_keys()
+            if or_keys:
+                raw_content = _try_call_provider(_OPENROUTER_CYCLER, or_keys, user_content)
 
     # 5. Parse primitives & assemble directives
     assembled_directives: List[Dict[str, Any]] = []

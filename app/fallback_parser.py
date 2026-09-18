@@ -56,6 +56,37 @@ def _parse_time_anchor(text: str, default_meridiem: Optional[str] = None) -> Opt
     return None
 
 
+_BARE_HOUR = re.compile(r"\d{1,2}(?::\d{2})?")
+_MERIDIEM_END = re.compile(r"(am|pm)$")
+
+
+def _share_meridiem(start: str, end: str) -> Tuple[str, str]:
+    """Gives a bare hour the am/pm of the other end of the range, e.g. '1-3 PM' -> ('1 pm', '3 pm').
+
+    Both am/pm readings are tried and the shorter window wins, so '11 to 3 PM' is 11 AM-3 PM and
+    '10 to 2 AM' is 10 PM-2 AM. Ranges where both ends are bare (24-hour style) are left alone.
+    """
+    start, end = start.strip(), end.strip()
+    for bare, other, bare_is_start in ((start, end, True), (end, start, False)):
+        given = _MERIDIEM_END.search(other)
+        if not (_BARE_HOUR.fullmatch(bare) and given):
+            continue
+        same = given.group(1)
+        best: Optional[Tuple[int, str]] = None
+        for meridiem in (same, "am" if same == "pm" else "pm"):
+            candidate = f"{bare} {meridiem}"
+            s = _parse_time_anchor(candidate if bare_is_start else other)
+            e = _parse_time_anchor(other if bare_is_start else candidate)
+            if s is None or e is None:
+                continue
+            length = (e - s) % 24 or 24
+            if best is None or length < best[0]:
+                best = (length, candidate)
+        if best:
+            return (best[1], end) if bare_is_start else (start, best[1])
+    return start, end
+
+
 def extract_hours_window(text: str) -> Optional[List[int]]:
     """Extracts half-open interval [start, end) hours as a sorted list of unique ints 0..23."""
     lower = text.lower()
@@ -107,6 +138,7 @@ def extract_hours_window(text: str) -> Optional[List[int]]:
                     s_str = f"{s_str} {meridiem}"
                 e_str = f"{e_str} {meridiem}"
 
+            s_str, e_str = _share_meridiem(s_str, e_str)
             s = _parse_time_anchor(s_str)
             e = _parse_time_anchor(e_str)
 
